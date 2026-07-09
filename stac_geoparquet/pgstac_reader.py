@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import orjson
 import psycopg
@@ -269,6 +269,7 @@ class Partition:
     start: datetime | None
     end: datetime | None
     last_updated: datetime
+    frequency: Literal["yearly", "monthly"] | None
 
 
 def get_pgstac_partitions(
@@ -282,7 +283,7 @@ def get_pgstac_partitions(
             # in the pgstac_to_parquet function
             q = """
                 SELECT
-                    collection,
+                    partitions_view.collection,
                     CASE WHEN lower(partition_dtrange) = '-infinity' OR upper(partition_dtrange) = 'infinity' THEN
                         'items.parquet'
                     ELSE
@@ -294,8 +295,14 @@ def get_pgstac_partitions(
                     END AS partition,
                     lower(dtrange) as start,
                     upper(dtrange) + '.000001 seconds' as end,
-                    last_updated
+                    last_updated,
+                    CASE collections.partition_trunc
+                        WHEN 'year' THEN 'yearly'
+                        WHEN 'month' THEN 'monthly'
+                        ELSE NULL
+                    END AS frequency
                 FROM partitions_view
+                JOIN collections ON collections.id = partitions_view.collection
                 """
             args: Any = ()
             if updated_after is not None:

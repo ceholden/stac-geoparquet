@@ -39,6 +39,7 @@ def test_sync_pgstac_to_parquet_with_scheme_prefixed_output_path(tmp_path, monke
         start=None,
         end=None,
         last_updated=datetime(2024, 1, 1),
+        frequency=None,
     )
     monkeypatch.setattr(
         pgstac_reader, "get_pgstac_partitions", lambda *a, **k: iter([partition])
