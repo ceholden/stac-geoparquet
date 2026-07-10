@@ -12,6 +12,7 @@ from pypgstac.load import Loader
 from stac_geoparquet import pgstac_reader
 from stac_geoparquet.pgstac_reader import (
     Partition,
+    _build_order_by,
     pgstac_dsn,
     pgstac_to_arrow,
     pgstac_to_iter,
@@ -63,6 +64,48 @@ def test_sync_pgstac_to_parquet_with_scheme_prefixed_output_path(tmp_path, monke
 
     assert (tmp_path / "root").exists()
     assert "naip" in str(captured["output_path"])
+
+
+@pytest.mark.parametrize(
+    ("sortby", "expected"),
+    [
+        ([("datetime", "desc")], "ORDER BY datetime DESC, id ASC"),
+        ([("id", "desc")], "ORDER BY id DESC"),
+        (
+            [("datetime", "desc"), ("id", "asc")],
+            "ORDER BY datetime DESC, id ASC",
+        ),
+    ],
+)
+def test_build_order_by(sortby, expected):
+    assert _build_order_by(sortby) == expected
+
+
+def test_build_order_by_empty_raises():
+    with pytest.raises(ValueError, match="non-empty list"):
+        _build_order_by([])
+    with pytest.raises(ValueError, match="non-empty list"):
+        _build_order_by(None)
+
+def test_build_order_by_bad_field_raises():
+    with pytest.raises(ValueError, match="Unsupported sortby field"):
+        _build_order_by([("cloud_cover", "asc")])
+
+
+def test_build_order_by_bad_direction_raises():
+    with pytest.raises(ValueError, match="Unsupported sortby direction"):
+        _build_order_by([("datetime", "sideways")])
+
+
+def test_pgstac_to_iter_raises_for_search_and_sortby():
+    with pytest.raises(ValueError, match="Cannot use search and sortby"):
+        list(
+            pgstac_reader.pgstac_to_iter(
+                "postgres://unused",
+                search={"collections": ["naip"]},
+                sortby=[("datetime", "desc")],
+            )
+        )
 
 
 @pytest.fixture(scope="session")
@@ -136,6 +179,32 @@ def test_pgstac_reader_iter(pgstac_postgres):
     for item in items:
         assert item["collection"] == "naip"
         assert item["geometry"]["type"] == "Polygon"
+
+
+def test_pgstac_reader_iter_sortby(pgstac_postgres):
+    """
+    Test that `sortby` orders rows read directly from the `items` table, and
+    that `id` is auto-appended as a tiebreaker for deterministic ordering.
+    """
+    items = list(
+        pgstac_to_iter(pgstac_postgres, collection="naip", sortby=[("id", "asc")])
+    )
+    ids = [item["id"] for item in items]
+    assert ids == sorted(ids)
+
+    items_desc = list(
+        pgstac_to_iter(pgstac_postgres, collection="naip", sortby=[("id", "desc")])
+    )
+    assert [item["id"] for item in items_desc] == sorted(ids, reverse=True)
+
+    # All 4 NAIP fixture items share the same `datetime`, so this exercises the
+    # auto-appended `id ASC` tiebreaker for a deterministic result.
+    items_by_datetime = list(
+        pgstac_to_iter(
+            pgstac_postgres, collection="naip", sortby=[("datetime", "desc")]
+        )
+    )
+    assert [item["id"] for item in items_by_datetime] == sorted(ids)
 
 
 def test_pgstac_reader_arrow(pgstac_postgres):

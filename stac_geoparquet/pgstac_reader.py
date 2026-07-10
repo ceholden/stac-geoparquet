@@ -2,11 +2,11 @@ import functools
 import logging
 import random
 import string
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args
 
 import orjson
 import psycopg
@@ -128,6 +128,49 @@ def pgstac_dsn(conninfo: str | None, statement_timeout: int | None) -> str:
     return psycopg.conninfo.make_conninfo("", **connd)
 
 
+PGSTAC_SORTABLE_FIELDS = Literal["id", "collection", "datetime", "end_datetime"]
+PGSTAC_SORT_DIRECTIONS = Literal["asc", "desc"]
+
+# Runtime include lists derived from the Literal aliases above. These
+# inclusion lists make it safe to build SQL string since we can't parameterize
+# identifiers (only values).
+_SORTABLE_FIELDS = frozenset(get_args(PGSTAC_SORTABLE_FIELDS))
+_SORT_DIRECTION_SQL: dict[str, str] = {
+    direction: direction.upper() for direction in get_args(PGSTAC_SORT_DIRECTIONS)
+}
+
+
+def _build_order_by(sortby: Sequence[tuple[str, str]]) -> str:
+    """
+    Build a safe ORDER BY clause from an include-listed set of (field, direction) pairs,
+    appending `id ASC` as a tiebreaker for deterministic ordering unless `id` is already
+    present.
+    """
+    if not sortby:
+        raise ValueError("sortby must be a non-empty list of (field, direction) tuples")
+
+    if "id" not in {field for field, _ in sortby}:
+        sortby = [*sortby, ("id", "asc")]
+
+    clauses = []
+    for field, direction in sortby:
+        if field not in _SORTABLE_FIELDS:
+            raise ValueError(
+                f"Unsupported sortby field {field!r}; must be one of "
+                f"{sorted(_SORTABLE_FIELDS)}"
+            )
+        try:
+            sql_direction = _SORT_DIRECTION_SQL[direction]
+        except KeyError:
+            raise ValueError(
+                f"Unsupported sortby direction {direction!r}; must be one of "
+                f"{sorted(_SORT_DIRECTION_SQL)}"
+            ) from None
+        clauses.append(f"{field} {sql_direction}")
+
+    return "ORDER BY " + ", ".join(clauses)
+
+
 def pgstac_to_iter(
     conninfo: str | None,
     collection: str | None = None,
@@ -137,7 +180,17 @@ def pgstac_to_iter(
     statement_timeout: int | None = None,
     cursor_itersize: int = 10000,
     row_func: Callable | None = None,
+    sortby: list[tuple[PGSTAC_SORTABLE_FIELDS, PGSTAC_SORT_DIRECTIONS]] | None = None,
 ) -> Iterator[dict[str, Any]]:
+    """
+    Stream items from pgstac as an iterator of STAC item dicts.
+
+    `sortby` controls row order when reading directly from the `items` table. Defaults
+    to `None`, preserving the unordered behavior of a plain table scan. `id` is
+    auto-appended ascending as a tiebreaker for deterministic ordering unless already
+    present. `sortby` is mutually exclusive with `search`, which has its own native
+    `sortby` support inside the search body.
+    """
     logger.info("Fetching Data from PGStac Into an Iterator of Items")
     conninfo = pgstac_dsn(conninfo, statement_timeout)
 
@@ -145,6 +198,12 @@ def pgstac_to_iter(
         collection is not None or start_datetime is not None or end_datetime is not None
     ):
         raise ValueError("Cannot use search and collection/datetime at the same time")
+    if search is not None and sortby is not None:
+        raise ValueError(
+            "Cannot use search and sortby at the same time; put a `sortby` key "
+            "in the `search` dict instead, using pgstac's native "
+            '`[{"field": ..., "direction": ...}]` format.'
+        )
     if start_datetime is not None and end_datetime is None:
         end_datetime = datetime.now(timezone.utc)
 
@@ -153,7 +212,7 @@ def pgstac_to_iter(
 
     if search is not None:
         logger.info(f"Using CQL2 Filter {search}")
-        query = "SELECT * FROM search(%s);"
+        query = "SELECT * FROM search(%s)"
         args = (search,)
     elif (
         collection is not None
@@ -163,16 +222,19 @@ def pgstac_to_iter(
         logger.info(
             f"Using Collection {collection}, Start {start_datetime}, End {end_datetime}"
         )
-        query = "SELECT * FROM items WHERE collection = %s AND datetime >= %s AND datetime < %s;"
+        query = "SELECT * FROM items WHERE collection = %s AND datetime >= %s AND datetime < %s"
         args = (collection, start_datetime, end_datetime)
     elif collection is not None:
         logger.info(f"Using Collection {collection}")
-        query = "SELECT * FROM items WHERE collection = %s;"
+        query = "SELECT * FROM items WHERE collection = %s"
         args = (collection,)
     else:
         logger.info("With no filter, fetching all items")
-        query = "SELECT * FROM items;"
+        query = "SELECT * FROM items"
         args = ()
+    if sortby is not None:
+        query += f" {_build_order_by(sortby)}"
+    query += ";"
     curname = "".join(random.choices(string.ascii_lowercase, k=32))
     with psycopg.connect(conninfo) as conn:
         with conn.cursor(curname, row_factory=PgstacRowFactory) as cur:  # type: ignore
@@ -191,6 +253,7 @@ def pgstac_to_arrow(
     start_datetime: datetime | None = None,
     end_datetime: datetime | None = None,
     search: dict[str, Any] | None = None,
+    sortby: list[tuple[PGSTAC_SORTABLE_FIELDS, PGSTAC_SORT_DIRECTIONS]] | None = None,
     chunk_size: int = DEFAULT_JSON_CHUNK_SIZE,
     schema: ACCEPTED_SCHEMA_OPTIONS = "FirstBatch",
     statement_timeout: int | None = None,
@@ -209,6 +272,7 @@ def pgstac_to_arrow(
         statement_timeout=statement_timeout,
         cursor_itersize=chunk_size,
         row_func=row_func,
+        sortby=sortby,
     )
     return parse_stac_items_to_arrow(
         items, chunk_size=chunk_size, schema=schema, tmpdir=tmpdir
@@ -222,6 +286,7 @@ def pgstac_to_parquet(
     start_datetime: datetime | None = None,
     end_datetime: datetime | None = None,
     search: dict[str, Any] | None = None,
+    sortby: list[tuple[PGSTAC_SORTABLE_FIELDS, PGSTAC_SORT_DIRECTIONS]] | None = None,
     chunk_size: int = DEFAULT_JSON_CHUNK_SIZE,
     schema: ACCEPTED_SCHEMA_OPTIONS = "FirstBatch",
     statement_timeout: int | None = None,
@@ -249,6 +314,7 @@ def pgstac_to_parquet(
         statement_timeout=statement_timeout,
         cursor_itersize=chunk_size,
         row_func=row_func,
+        sortby=sortby,
     )
 
     return parse_stac_items_to_parquet(
@@ -318,6 +384,7 @@ def sync_pgstac_to_parquet(
     row_func: Callable | None = None,
     schema_version: SUPPORTED_PARQUET_SCHEMA_VERSIONS = DEFAULT_PARQUET_SCHEMA_VERSION,
     filesystem: pyarrow.fs.FileSystem | None = None,
+    sortby: list[tuple[PGSTAC_SORTABLE_FIELDS, PGSTAC_SORT_DIRECTIONS]] | None = None,
     **kwargs: Any,
 ) -> str:
     """
@@ -349,6 +416,7 @@ def sync_pgstac_to_parquet(
             statement_timeout=statement_timeout,
             schema_version=schema_version,
             filesystem=filesystem,
+            sortby=sortby,
             **kwargs,
         )
     return str(of)
